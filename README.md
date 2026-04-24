@@ -77,12 +77,14 @@ Options:
 | `--dry-run` | Preview changes without modifying files |
 | `--no-backup` | Skip automatic backup |
 | `--force` | Proceed despite validation errors (e.g., duplicates) |
+| `-y, --yes` | Skip confirmation prompt |
 | `-v, --verbose` | Show per-workspace progress |
 
 ### `validate` — Check consistency across workspaces
 
-Verifies that all interval workspaces have the same sample list and no
-duplicate names:
+Verifies consistency across all workspaces found under the path — checks
+for duplicate sample names, duplicate `row_idx` values, and mismatched
+`sample_name`↔`row_idx` mappings between workspaces:
 
 ```bash
 ./gatk_db_rename_sample.py validate /path/to/db
@@ -98,27 +100,30 @@ Restores `callset.json` from the most recent backup in each workspace:
 
 ## DB Path
 
-The db path can be either:
-
-- A **single workspace** directory (containing `callset.json`)
-- A **parent directory** containing multiple interval workspaces
-
-For example, if your GenomicsDB was created with interval-based workspaces:
+The given path is searched **recursively** for GenomicsDB workspaces
+(directories containing `callset.json`). For example:
 
 ```
-db/
-├── my_db.Chr01-00000001-05000000/
-│   ├── callset.json
-│   ├── vidmap.json
-│   └── ...
-├── my_db.Chr01-05000001-10000000/
-│   ├── callset.json
+data/
+├── project_A/
+│   ├── chr1_interval_1/
+│   │   └── callset.json
+│   └── chr1_interval_2/
+│       └── callset.json
+├── project_B/
+│   ├── chr1_interval_1/
+│   │   └── callset.json
 │   └── ...
 └── ...
 ```
 
-You can point the tool at the `db/` directory, and it will find and update
-all workspaces automatically.
+If you point the tool at `data/`, it will find workspaces in **both**
+`project_A/` and `project_B/`.
+
+> **Caution:** All GenomicsDB workspaces found under the path will be
+> affected, including unrelated databases. Always use `--dry-run` first
+> to check which workspaces will be modified. The `rename` command asks
+> for confirmation by default (use `--yes` to skip).
 
 ## How It Works
 
@@ -177,7 +182,7 @@ bcftools view -S ^exclude.txt output.vcf -Oz -o final.vcf.gz
 By default, a timestamped backup is created before each modification:
 
 ```
-callset.json.bak.20260424_103500
+callset.json.bak.20260424_103500_123456
 ```
 
 The backup is stored alongside the original `callset.json` in each workspace

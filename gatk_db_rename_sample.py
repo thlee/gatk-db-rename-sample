@@ -27,13 +27,16 @@ Usage:
     gatk_db_rename_sample.py restore /path/to/db
 
 How it works:
-    GenomicsDB stores sample metadata in callset.json within each interval
-    workspace. Each entry contains sample_name, row_idx, idx_in_file, and
-    stream_name. This tool modifies only the sample_name field while keeping
-    row_idx intact, preserving consistency with the underlying TileDB array.
+    GenomicsDB stores sample metadata in callset.json within each workspace.
+    Each entry contains sample_name, row_idx, idx_in_file, and stream_name.
+    This tool modifies only the sample_name field while keeping row_idx
+    intact, preserving consistency with the underlying TileDB array.
 
-    The db path can be a single workspace (containing callset.json) or a
-    parent directory containing multiple interval workspaces.
+    The given path is searched recursively for GenomicsDB workspaces
+    (directories containing callset.json). This means ALL workspaces found
+    under the path will be affected — including unrelated databases if
+    they happen to be in subdirectories. Always use --dry-run first to
+    verify which workspaces will be modified.
 
 Tips:
     To effectively REMOVE samples from GenomicsDB output, rename them with
@@ -242,48 +245,98 @@ def cmd_rename(args):
         sys.exit(1)
 
     workspaces = find_workspaces(args.db)
-    data = load_callset(workspaces[0])
-    current_names = get_sample_names(data)
-    applicable = sum(1 for n in current_names if n in rename_map)
-    warnings, errors = validate_rename(current_names, rename_map)
 
-    print(f"Workspaces:  {len(workspaces)}")
-    print(f"Samples:     {len(current_names)}")
-    print(f"Mappings:    {len(rename_map)} (applicable: {applicable})")
+    # First pass: scan all workspaces
+    ws_info = []
+    for ws in workspaces:
+        data = load_callset(ws)
+        names = get_sample_names(data)
+        applicable = sum(1 for n in names if n in rename_map)
+        if applicable > 0:
+            warnings, errors = validate_rename(names, rename_map)
+        else:
+            warnings, errors = [], []
+        ws_info.append((ws, data, len(names), applicable, warnings, errors))
 
-    for w in warnings:
-        print(f"  Warning: {w}")
-    for e in errors:
-        print(f"  ERROR: {e}")
+    # Display summary table
+    name_w = max((len(ws.name) for ws, *_ in ws_info), default=9)
+    name_w = max(name_w, 9)
 
-    if errors and not args.force:
-        print("\nAborted. Use --force to override errors.", file=sys.stderr)
-        sys.exit(1)
+    print(f"Found {len(workspaces)} workspace(s), {len(rename_map)} mapping(s)\n")
+    print(f"  {'#':>4}  {'Workspace':<{name_w}}  {'Samples':>7}  {'Renames':>7}  Status")
+    print(f"  {'':->4}  {'':->{name_w}}  {'':->7}  {'':->7}  ------")
 
+    for i, (ws, data, n_samples, applicable, warnings, errors) in enumerate(ws_info):
+        if applicable == 0:
+            status = "-"
+        elif errors:
+            status = f"{len(errors)} error(s)"
+        elif warnings:
+            status = f"{len(warnings)} warning(s)"
+        else:
+            status = "OK"
+        print(f"  {i+1:>4}  {ws.name:<{name_w}}  {n_samples:>7}  {applicable:>7}  {status}")
+
+    # Show unique warnings/errors
+    all_warnings = sorted(set(w for *_, warnings, _ in ws_info for w in warnings))
+    all_errors = sorted(set(e for *_, errors in ws_info for e in errors))
+    if all_warnings or all_errors:
+        print()
+        for w in all_warnings:
+            print(f"  Warning: {w}")
+        for e in all_errors:
+            print(f"  ERROR: {e}")
+
+    # Dry-run: show rename preview from first applicable workspace
     if args.dry_run:
-        print(f"\n[DRY-RUN] Changes that would be applied:")
-        for entry in data["callsets"]:
-            old = entry["sample_name"]
-            if old in rename_map:
-                print(f"  {old}  ->  {rename_map[old]}")
+        for ws, data, _, applicable, _, _ in ws_info:
+            if applicable > 0:
+                print(f"\n[DRY-RUN] Renames that would be applied:")
+                for entry in data["callsets"]:
+                    old = entry["sample_name"]
+                    if old in rename_map:
+                        print(f"  {old}  ->  {rename_map[old]}")
+                break
         print(f"\nNo changes made (dry-run mode).")
         return
 
-    print(f"\nApplying renames to {len(workspaces)} workspace(s)...")
-    for i, ws in enumerate(workspaces):
-        data = load_callset(ws)
-        renamed = 0
+    # Second pass: per-workspace confirmation and rename
+    modified = 0
+    skipped = 0
+    for i, (ws, data, _, applicable, _, errors) in enumerate(ws_info):
+        if applicable == 0:
+            continue
+
+        if errors and not args.force:
+            skipped += 1
+            continue
+
+        if not args.yes:
+            try:
+                answer = input(f"\n  [{i+1}] {ws.name} — rename {applicable} sample(s)? [y/N] ")
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                sys.exit(1)
+            if answer.lower() not in ("y", "yes"):
+                skipped += 1
+                continue
+
         for entry in data["callsets"]:
             if entry["sample_name"] in rename_map:
                 entry["sample_name"] = rename_map[entry["sample_name"]]
-                renamed += 1
         save_callset(ws, data, backup=not args.no_backup)
+        modified += 1
         if args.verbose:
-            print(f"  [{i+1}/{len(workspaces)}] {ws.name}: {renamed} renamed")
+            print(f"  [{i+1}] {ws.name}: {applicable} renamed")
 
-    print(f"Done. Renamed {applicable} sample(s) across {len(workspaces)} workspace(s).")
-    if not args.no_backup:
-        print(f"Backups saved as callset.json.bak.*")
+    if modified:
+        print(f"\nDone. Modified {modified} workspace(s).")
+        if skipped:
+            print(f"  Skipped: {skipped}")
+        if not args.no_backup:
+            print(f"Backups saved as callset.json.bak.*")
+    else:
+        print(f"\nNo workspaces were modified.")
 
 
 def cmd_validate(args):
@@ -409,14 +462,14 @@ tips:
 
     # --- list ---
     p_list = subparsers.add_parser("list", help="List samples in the database")
-    p_list.add_argument("db", help="GenomicsDB path (workspace or parent dir)")
+    p_list.add_argument("db", help="Path to search for GenomicsDB workspaces (recursive)")
     p_list.add_argument("--count", action="store_true", help="Print only the count")
     p_list.add_argument("--sort", action="store_true", help="Sort alphabetically")
     p_list.add_argument("-v", "--verbose", action="store_true")
 
     # --- rename ---
     p_rename = subparsers.add_parser("rename", help="Rename samples")
-    p_rename.add_argument("db", help="GenomicsDB path (workspace or parent dir)")
+    p_rename.add_argument("db", help="Path to search for GenomicsDB workspaces (recursive)")
     group = p_rename.add_mutually_exclusive_group()
     group.add_argument("--map", metavar="FILE",
                        help="TSV mapping file (old_name<TAB>new_name)")
@@ -428,16 +481,18 @@ tips:
                           help="Skip backup creation")
     p_rename.add_argument("--force", action="store_true",
                           help="Proceed despite validation errors")
+    p_rename.add_argument("-y", "--yes", action="store_true",
+                          help="Skip confirmation prompt")
     p_rename.add_argument("-v", "--verbose", action="store_true")
 
     # --- validate ---
     p_val = subparsers.add_parser("validate", help="Validate sample consistency")
-    p_val.add_argument("db", help="GenomicsDB path (workspace or parent dir)")
+    p_val.add_argument("db", help="Path to search for GenomicsDB workspaces (recursive)")
     p_val.add_argument("-v", "--verbose", action="store_true")
 
     # --- restore ---
     p_res = subparsers.add_parser("restore", help="Restore callset.json from backup")
-    p_res.add_argument("db", help="GenomicsDB path (workspace or parent dir)")
+    p_res.add_argument("db", help="Path to search for GenomicsDB workspaces (recursive)")
     p_res.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
