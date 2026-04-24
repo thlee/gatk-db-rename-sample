@@ -104,8 +104,17 @@ def find_workspaces(db_path):
 
 def load_callset(workspace):
     """Load callset.json from a workspace."""
-    with open(Path(workspace) / "callset.json") as f:
-        return json.load(f)
+    path = Path(workspace) / "callset.json"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: malformed callset.json in {workspace}: {e}", file=sys.stderr)
+        sys.exit(1)
+    if "callsets" not in data:
+        print(f"Error: callset.json in {workspace} missing 'callsets' key", file=sys.stderr)
+        sys.exit(1)
+    return data
 
 
 def save_callset(workspace, data, backup=True):
@@ -113,7 +122,7 @@ def save_callset(workspace, data, backup=True):
     path = Path(workspace) / "callset.json"
 
     if backup:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         shutil.copy2(path, path.with_suffix(f".json.bak.{timestamp}"))
 
     with open(path, "w") as f:
@@ -217,6 +226,12 @@ def cmd_rename(args):
         rename_map = load_rename_map(args.map)
     elif args.old and args.new:
         rename_map = {args.old: args.new}
+    elif args.old:
+        print("Error: --old requires --new", file=sys.stderr)
+        sys.exit(1)
+    elif args.new:
+        print("Error: --new requires --old", file=sys.stderr)
+        sys.exit(1)
     else:
         print("Error: provide either --map FILE or --old NAME --new NAME",
               file=sys.stderr)
@@ -280,6 +295,8 @@ def cmd_validate(args):
     reference_names = None
     reference_ws = None
 
+    reference_mapping = None
+
     for ws in workspaces:
         data = load_callset(ws)
         names = get_sample_names(data)
@@ -289,17 +306,40 @@ def cmd_validate(args):
         if dups:
             issues.append(f"{ws.name}: duplicate sample names: {dups}")
 
+        # Duplicate row_idx within workspace
+        row_indices = [entry["row_idx"] for entry in data["callsets"]]
+        dup_rows = {k: v for k, v in Counter(row_indices).items() if v > 1}
+        if dup_rows:
+            issues.append(f"{ws.name}: duplicate row_idx values: {dup_rows}")
+
         # Consistency across workspaces
         name_tuple = tuple(sorted(names))
+        name_to_row = {entry["sample_name"]: entry["row_idx"] for entry in data["callsets"]}
+
         if reference_names is None:
             reference_names = name_tuple
             reference_ws = ws.name
-        elif name_tuple != reference_names:
-            ref_set, cur_set = set(reference_names), set(names)
-            issues.append(
-                f"{ws.name}: differs from {reference_ws} "
-                f"(only in ref: {len(ref_set - cur_set)}, only here: {len(cur_set - ref_set)})"
-            )
+            reference_mapping = name_to_row
+        else:
+            if name_tuple != reference_names:
+                ref_set, cur_set = set(reference_names), set(names)
+                issues.append(
+                    f"{ws.name}: differs from {reference_ws} "
+                    f"(only in ref: {len(ref_set - cur_set)}, only here: {len(cur_set - ref_set)})"
+                )
+
+            # row_idx consistency across workspaces
+            mismatched = [
+                n for n in set(name_to_row) & set(reference_mapping)
+                if name_to_row[n] != reference_mapping[n]
+            ]
+            if mismatched:
+                examples = ", ".join(sorted(mismatched)[:5])
+                suffix = f" ... and {len(mismatched)-5} more" if len(mismatched) > 5 else ""
+                issues.append(
+                    f"{ws.name}: row_idx mismatch vs {reference_ws} "
+                    f"for {len(mismatched)} sample(s): {examples}{suffix}"
+                )
 
     print(f"Samples: {len(reference_names) if reference_names else 0}")
 
@@ -326,8 +366,12 @@ def cmd_restore(args):
         if args.verbose:
             print(f"  {ws.name}: restored from {Path(backups[-1]).name}")
 
+    total = len(workspaces)
     if restored:
         print(f"Restored {restored} workspace(s) from backup.")
+        if restored < total:
+            print(f"  Warning: {total - restored} workspace(s) had no backup and were not restored.",
+                  file=sys.stderr)
     else:
         print("No backups found.")
 

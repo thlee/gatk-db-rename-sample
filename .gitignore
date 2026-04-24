@@ -6,4 +6,5 @@ dist/
 build/
 .eggs/
 *.bak.*
+CLAUDE.md
 .claude/
